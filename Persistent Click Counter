@@ -1,0 +1,291 @@
+
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Persistent Click Counter</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Configure Tailwind to use the Inter font and enable JIT mode for faster compilation -->
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                    },
+                    colors: {
+                        'primary-blue': '#2563EB',
+                        'primary-blue-dark': '#1E40AF',
+                        'secondary-red': '#DC2626',
+                        'secondary-red-dark': '#B91C1C',
+                        'background-gray': '#F3F4F6',
+                        'card-white': '#FFFFFF',
+                    }
+                },
+            }
+        }
+    </script>
+    <style>
+        /* Set the Inter font as default */
+        body {
+            font-family: 'Inter', sans-serif;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+        /* Custom spinner style for loading state */
+        .spinner {
+            border: 4px solid rgba(255, 255, 255, 0.3);
+            border-top: 4px solid #fff;
+            border-radius: 50%;
+            width: 1.5rem;
+            height: 1.5rem;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="bg-background-gray min-h-screen flex items-center justify-center p-4">
+
+    <!-- Counter Card -->
+    <div id="counter-card" class="w-full max-w-md bg-card-white p-8 sm:p-10 rounded-xl shadow-2xl transition duration-500 ease-in-out transform hover:scale-[1.02]">
+        <h1 class="text-3xl sm:text-4xl font-extrabold text-gray-900 mb-6 text-center">
+            Click Counter
+        </h1>
+        <p class="text-center text-gray-500 mb-8">
+            Your clicks are saved in real-time using Firestore!
+        </p>
+
+        <!-- Display Area -->
+        <div class="bg-primary-blue-dark text-white rounded-xl p-8 mb-8 shadow-inner flex flex-col items-center justify-center h-40">
+            <p id="status-message" class="text-lg font-medium mb-2">Loading...</p>
+            <div id="count-display" class="text-6xl sm:text-8xl font-black transition-all duration-300 transform scale-100">
+                0
+            </div>
+        </div>
+
+        <!-- Buttons -->
+        <div class="flex flex-col space-y-4">
+            <button id="increment-button" disabled class="flex items-center justify-center w-full bg-primary-blue text-white font-bold py-4 rounded-xl shadow-lg hover:bg-primary-blue-dark transition duration-300 ease-in-out transform hover:scale-[1.01] disabled:opacity-50 disabled:cursor-not-allowed group">
+                <span id="increment-text">Click Me!</span>
+                <div id="increment-loading" class="spinner ml-3 hidden"></div>
+            </button>
+            <button id="reset-button" disabled class="w-full bg-secondary-red text-white font-semibold py-3 rounded-xl shadow-md hover:bg-secondary-red-dark transition duration-300 ease-in-out disabled:opacity-50 disabled:cursor-not-allowed">
+                Reset Count
+            </button>
+        </div>
+
+        <!-- User Info -->
+        <p id="user-info" class="mt-6 text-xs text-gray-400 text-center truncate">User ID: N/A</p>
+    </div>
+
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection, runTransaction, getDoc, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global variables provided by the Canvas environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // HTML Elements
+        const countDisplay = document.getElementById('count-display');
+        const statusMessage = document.getElementById('status-message');
+        const incrementButton = document.getElementById('increment-button');
+        const resetButton = document.getElementById('reset-button');
+        const incrementText = document.getElementById('increment-text');
+        const incrementLoading = document.getElementById('increment-loading');
+        const userInfo = document.getElementById('user-info');
+        
+        let db, auth;
+        let isAuthReady = false;
+        let isProcessing = false; // Prevents spamming write operations
+
+        // 1. Initialize Firebase
+        if (firebaseConfig) {
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                // Enable debug logging for firestore
+                setLogLevel('Debug');
+            } catch (error) {
+                console.error("Error initializing Firebase:", error);
+                statusMessage.textContent = "Error: Firebase Init Failed";
+                return;
+            }
+        } else {
+            console.error("Firebase configuration is missing.");
+            statusMessage.textContent = "Error: Config Missing";
+            return;
+        }
+
+        /**
+         * Retries a promise-returning function with exponential backoff.
+         * @param {Function} fn The function to retry.
+         * @param {number} maxRetries The maximum number of retries.
+         * @param {number} delay The initial delay in milliseconds.
+         */
+        const retryWithBackoff = async (fn, maxRetries = 3, delay = 1000) => {
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    return await fn();
+                } catch (error) {
+                    if (i === maxRetries - 1) throw error;
+                    await new Promise(resolve => setTimeout(resolve, delay * Math.pow(2, i)));
+                }
+            }
+        };
+
+        // 2. Authentication and Setup
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                const userId = user.uid;
+                userInfo.textContent = `User ID: ${userId}`;
+                isAuthReady = true;
+                // Start listening to the database after authentication
+                startRealtimeListener(userId);
+            } else {
+                // Sign in anonymously if no custom token is provided or after sign-out
+                try {
+                    await retryWithBackoff(async () => {
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    });
+                } catch (error) {
+                    console.error("Authentication failed:", error);
+                    statusMessage.textContent = "Error: Auth Failed";
+                }
+            }
+        });
+
+        // 3. Define Firestore paths
+        // Using a public document for a simple, global click counter for this app.
+        const CLICK_COUNT_PATH = `/artifacts/${appId}/public/data/click_counter/global_count`;
+
+        /**
+         * Starts the real-time listener for the global count.
+         */
+        const startRealtimeListener = (userId) => {
+            // Get the document reference
+            const docRef = doc(db, CLICK_COUNT_PATH);
+
+            // Set up the real-time listener
+            onSnapshot(docRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+                    const count = data.count || 0;
+                    updateDisplay(count, "Ready to click!");
+                } else {
+                    // Document doesn't exist, initialize it to 0
+                    updateDisplay(0, "Initializing counter...");
+                    // Try to create the document with initial value 0
+                    setDoc(docRef, { count: 0, initializedBy: userId, createdAt: new Date().toISOString() }, { merge: true })
+                        .catch(err => console.error("Error initializing document:", err));
+                }
+                // Enable buttons once data is loaded/initialized
+                incrementButton.disabled = false;
+                resetButton.disabled = false;
+            }, (error) => {
+                console.error("Error listening to Firestore:", error);
+                updateDisplay('?', "Error loading count.");
+                incrementButton.disabled = true;
+                resetButton.disabled = true;
+            });
+        };
+
+        /**
+         * Updates the UI display.
+         * @param {number|string} count The current click count or an error string.
+         * @param {string} status The status message to display.
+         */
+        const updateDisplay = (count, status) => {
+            countDisplay.textContent = count;
+            statusMessage.textContent = status;
+        };
+        
+        /**
+         * Handles the click event for incrementing the counter.
+         */
+        const handleIncrement = async () => {
+            if (!isAuthReady || isProcessing) return;
+            isProcessing = true;
+            
+            // Show loading state
+            incrementText.textContent = 'Counting...';
+            incrementLoading.classList.remove('hidden');
+
+            const docRef = doc(db, CLICK_COUNT_PATH);
+
+            try {
+                // Use a transaction to safely increment the count
+                await retryWithBackoff(() => runTransaction(db, async (transaction) => {
+                    const sfDoc = await transaction.get(docRef);
+                    if (!sfDoc.exists()) {
+                        // If the document somehow disappeared, re-initialize it
+                        transaction.set(docRef, { count: 1 });
+                    } else {
+                        const newCount = (sfDoc.data().count || 0) + 1;
+                        transaction.update(docRef, { count: newCount });
+                    }
+                }));
+
+                // The onSnapshot listener handles the UI update
+                console.log("Count incremented successfully.");
+
+            } catch (e) {
+                console.error("Transaction failed: ", e);
+                statusMessage.textContent = "Error: Failed to count.";
+            } finally {
+                isProcessing = false;
+                // Hide loading state
+                incrementText.textContent = 'Click Me!';
+                incrementLoading.classList.add('hidden');
+            }
+        };
+
+        /**
+         * Handles the click event for resetting the counter.
+         */
+        const handleReset = async () => {
+             if (!isAuthReady || isProcessing) return;
+            
+            // Note: Per the instructions, we should avoid window.confirm(). 
+            // For a simple example, we will implement the reset directly.
+            
+            isProcessing = true;
+            resetButton.disabled = true;
+            resetButton.textContent = 'Resetting...';
+
+            const docRef = doc(db, CLICK_COUNT_PATH);
+
+            try {
+                // Set the count back to 0
+                await retryWithBackoff(() => setDoc(docRef, { count: 0 }, { merge: true }));
+                // The onSnapshot listener handles the UI update
+
+            } catch (e) {
+                console.error("Reset failed: ", e);
+                statusMessage.textContent = "Error: Failed to reset.";
+            } finally {
+                isProcessing = false;
+                resetButton.disabled = false;
+                resetButton.textContent = 'Reset Count';
+            }
+        };
+
+        // 4. Attach Event Listeners
+        incrementButton.addEventListener('click', handleIncrement);
+        resetButton.addEventListener('click', handleReset);
+
+    </script>
+</body>
+</html>
